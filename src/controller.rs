@@ -12,153 +12,37 @@ use netlink_packet_utils::{
 
 use crate::genl::GenericBuffer;
 
-pub(crate) mod constants {
-    pub const CTRL_CMD_UNSPEC: u8 = 0;
-    pub const CTRL_CMD_NEWFAMILY: u8 = 1;
-    pub const CTRL_CMD_DELFAMILY: u8 = 2;
-    pub const CTRL_CMD_GETFAMILY: u8 = 3;
-    pub const CTRL_CMD_NEWOPS: u8 = 4;
-    pub const CTRL_CMD_DELOPS: u8 = 5;
-    pub const CTRL_CMD_GETOPS: u8 = 6;
-    pub const CTRL_CMD_NEWMCAST_GRP: u8 = 7;
-    pub const CTRL_CMD_DELMCAST_GRP: u8 = 8;
-    #[allow(unused)]
-    pub const CTRL_CMD_GETMCAST_GRP: u8 = 9;
+pub const CTRL_CMD_UNSPEC: u8 = 0;
+pub const CTRL_CMD_NEWFAMILY: u8 = 1;
+pub const CTRL_CMD_DELFAMILY: u8 = 2;
+pub const CTRL_CMD_GETFAMILY: u8 = 3;
+pub const CTRL_CMD_NEWOPS: u8 = 4;
+pub const CTRL_CMD_DELOPS: u8 = 5;
+pub const CTRL_CMD_GETOPS: u8 = 6;
+pub const CTRL_CMD_NEWMCAST_GRP: u8 = 7;
+pub const CTRL_CMD_DELMCAST_GRP: u8 = 8;
+#[allow(unused)]
+pub const CTRL_CMD_GETMCAST_GRP: u8 = 9;
 
-    #[allow(unused)]
-    pub const CTRL_ATTR_UNSPEC: u16 = 0;
-    pub const CTRL_ATTR_FAMILY_ID: u16 = 1;
-    pub const CTRL_ATTR_FAMILY_NAME: u16 = 2;
-    pub const CTRL_ATTR_VERSION: u16 = 3;
-    pub const CTRL_ATTR_HDRSIZE: u16 = 4;
-    pub const CTRL_ATTR_MAXATTR: u16 = 5;
-    pub const CTRL_ATTR_OPS: u16 = 6;
-    pub const CTRL_ATTR_MCAST_GROUPS: u16 = 7;
+#[allow(unused)]
+pub const CTRL_ATTR_UNSPEC: u16 = 0;
+pub const CTRL_ATTR_FAMILY_ID: u16 = 1;
+pub const CTRL_ATTR_FAMILY_NAME: u16 = 2;
+pub const CTRL_ATTR_VERSION: u16 = 3;
+pub const CTRL_ATTR_HDRSIZE: u16 = 4;
+pub const CTRL_ATTR_MAXATTR: u16 = 5;
+pub const CTRL_ATTR_OPS: u16 = 6;
+pub const CTRL_ATTR_MCAST_GROUPS: u16 = 7;
 
-    #[allow(unused)]
-    pub const CTRL_ATTR_OP_UNSPEC: u16 = 0;
-    pub const CTRL_ATTR_OP_ID: u16 = 1;
-    pub const CTRL_ATTR_OP_FLAGS: u16 = 2;
+#[allow(unused)]
+pub const CTRL_ATTR_OP_UNSPEC: u16 = 0;
+pub const CTRL_ATTR_OP_ID: u16 = 1;
+pub const CTRL_ATTR_OP_FLAGS: u16 = 2;
 
-    #[allow(unused)]
-    pub const CTRL_ATTR_MCAST_GRP_UNSPEC: u16 = 0;
-    pub const CTRL_ATTR_MCAST_GRP_NAME: u16 = 1;
-    pub const CTRL_ATTR_MCAST_GRP_ID: u16 = 2;
-}
-
-macro_rules! missing {
-    ($attr: expr) => {
-        || DecodeError::from(concat!("attribute ", $attr, " is missing"))
-    };
-}
-
-macro_rules! impl_wrapped_attribute {
-    ($attr: ident ($type: tt): $kind: expr $(,)?) => {
-        impl Nla for $attr {
-            fn value_len(&self) -> usize {
-                impl_wrapped_attribute!(@length($type))(&self.0)
-            }
-
-            fn kind(&self) -> u16 {
-                $kind
-            }
-
-            fn emit_value(&self, buffer: &mut [u8]) {
-                impl_wrapped_attribute!(@emit(self.0) as $type in buffer)
-            }
-        }
-
-        impl<'buffer, T: AsRef<[u8]> + ?Sized> Parseable<NlaBuffer<&'buffer T>> for $attr {
-            fn parse(buffer: &NlaBuffer<&'buffer T>) -> Result<Self, DecodeError> {
-                impl_wrapped_attribute!(@parse(buffer.value()) as $type in $attr)
-            }
-        }
-
-        impl From<$type> for $attr {
-            fn from(v: $type) -> Self {
-                Self(v)
-            }
-        }
-
-        impl From<$attr> for $type {
-            fn from(attr: $attr) -> Self {
-            attr.0
-            }
-        }
-
-    };
-    (@length(String)) => {
-        String::len
-    };
-    (@length($_: tt)) => {
-        std::mem::size_of_val
-    };
-    (@parse($value: expr) as $type: tt in $attr: ident) => {
-        impl_wrapped_attribute!(@parse($value) as $type).map($attr)
-    };
-    (@parse($value: expr) as u16 ) => {
-        parsers::parse_u16($value)
-    };
-    (@parse($value: expr) as u32) => {
-        parsers::parse_u32($value)
-    };
-    (@parse($value: expr) as String) => {
-        parsers::parse_string($value)
-    };
-    (@emit($value: expr) as u16 in $buffer: ident) => {
-        NativeEndian::write_u16($buffer, $value)
-    };
-    (@emit($value: expr) as u32 in $buffer: ident) => {
-        NativeEndian::write_u32($buffer, $value)
-    };
-    (@emit($value: expr) as String in $buffer: ident) => {
-        $buffer[..$value.len()].copy_from_slice($value.as_bytes())
-    };
-}
-
-macro_rules! impl_nested_attribute_parse {
-    ($attr: ident: $($kind: tt => $field: tt: $type: tt),+ $(,)?) => {
-        impl<T: AsRef<[u8]>> Parseable<T> for $attr {
-            fn parse(buffer: &T) -> Result<Self, DecodeError> {
-                $(let mut $field = None;)*
-
-                for attribute in NlasIterator::new(buffer) {
-                    let attribute = attribute?;
-                    match attribute.kind() {
-                        $(
-                            constants::$kind => {
-                                $field.replace($type::parse(&attribute)?);
-                            }
-                        )*
-                        kind => {
-                            return Err(format!(
-                                concat!("encountered unexpected kind {} when parsing ", stringify!($attr)),
-                                kind
-                            )
-                            .into())
-                        }
-                    }
-                }
-
-                Ok(Self {
-                    $(
-                        $field: $field
-                            .ok_or_else(||
-                                DecodeError::from(
-                                    concat!(
-                                        "missing attribute ",
-                                        stringify!($kind),
-                                        " when parsing ",
-                                        stringify!($attr)
-                                    )
-                                )
-                            )?
-                    ),*
-                })
-            }
-        }
-    };
-}
+#[allow(unused)]
+pub const CTRL_ATTR_MCAST_GRP_UNSPEC: u16 = 0;
+pub const CTRL_ATTR_MCAST_GRP_NAME: u16 = 1;
+pub const CTRL_ATTR_MCAST_GRP_ID: u16 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct FamilyId(u16);
@@ -187,21 +71,25 @@ pub struct MulticastGroupId(u32);
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct MulticastGroupName(String);
 
-impl_wrapped_attribute!(FamilyId(u16): constants::CTRL_ATTR_FAMILY_ID);
-impl_wrapped_attribute!(FamilyName(String): constants::CTRL_ATTR_FAMILY_NAME);
-impl_wrapped_attribute!(Version(u32): constants::CTRL_ATTR_VERSION);
-impl_wrapped_attribute!(HeaderSize(u32): constants::CTRL_ATTR_HDRSIZE);
-impl_wrapped_attribute!(MaxAttributes(u32): constants::CTRL_ATTR_MAXATTR);
+impl_wrapped_attribute!(FamilyId(u16): CTRL_ATTR_FAMILY_ID);
+impl_wrapped_attribute!(FamilyName(String): CTRL_ATTR_FAMILY_NAME);
+impl_wrapped_attribute!(Version(u32): CTRL_ATTR_VERSION);
+impl_wrapped_attribute!(HeaderSize(u32): CTRL_ATTR_HDRSIZE);
+impl_wrapped_attribute!(MaxAttributes(u32): CTRL_ATTR_MAXATTR);
 
-impl_wrapped_attribute!(OperationId(u32): constants::CTRL_ATTR_OP_ID);
-impl_wrapped_attribute!(OperationFlags(u32): constants::CTRL_ATTR_OP_FLAGS);
+impl_wrapped_attribute!(OperationId(u32): CTRL_ATTR_OP_ID);
+impl_wrapped_attribute!(OperationFlags(u32): CTRL_ATTR_OP_FLAGS);
 
-impl_wrapped_attribute!(MulticastGroupId(u32): constants::CTRL_ATTR_MCAST_GRP_ID);
-impl_wrapped_attribute!(MulticastGroupName(String): constants::CTRL_ATTR_MCAST_GRP_NAME);
+impl_wrapped_attribute!(MulticastGroupId(u32): CTRL_ATTR_MCAST_GRP_ID);
+impl_wrapped_attribute!(MulticastGroupName(String): CTRL_ATTR_MCAST_GRP_NAME);
 
 impl FamilyName {
     pub fn new<T: Into<String>>(s: T) -> Self {
         Self(s.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
     }
 }
 
@@ -265,13 +153,13 @@ impl<'buffer, T: AsRef<[u8]> + ?Sized> Parseable<NlaBuffer<&'buffer T>> for Mult
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewFamily {
-    id: FamilyId,
-    name: FamilyName,
-    version: Version,
-    header_size: HeaderSize,
-    max_attributes: MaxAttributes,
-    operations: OperationList,
-    multicast_groups: MulticastGroupList,
+    pub id: FamilyId,
+    pub name: FamilyName,
+    pub version: Version,
+    pub header_size: HeaderSize,
+    pub max_attributes: MaxAttributes,
+    pub operations: OperationList,
+    pub multicast_groups: MulticastGroupList,
 }
 
 impl_nested_attribute_parse! {
@@ -301,8 +189,8 @@ impl ControlMessage {
 
     fn command(&self) -> u8 {
         match self {
-            ControlMessage::NewFamily(_) => constants::CTRL_CMD_NEWFAMILY,
-            ControlMessage::GetFamily(_) => constants::CTRL_CMD_GETFAMILY,
+            ControlMessage::NewFamily(_) => CTRL_CMD_NEWFAMILY,
+            ControlMessage::GetFamily(_) => CTRL_CMD_GETFAMILY,
         }
     }
 
@@ -355,7 +243,7 @@ impl<'buffer, B: AsRef<[u8]> + ?Sized> ParseableParametrized<GenericBuffer<&'buf
     ) -> Result<Self, DecodeError> {
         match message_type {
             0x10 => match buffer.command() {
-                constants::CTRL_CMD_NEWFAMILY => {
+                CTRL_CMD_NEWFAMILY => {
                     let new_family = NewFamily::parse(&buffer.attributes())?;
 
                     Ok(ControlMessage::NewFamily(new_family))
