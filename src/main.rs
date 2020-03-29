@@ -1,112 +1,222 @@
-#[macro_use]
-mod genl;
-
-mod constants;
-mod controller;
-mod nl80211;
-
-use crate::{
-    controller::{ControlMessage, FamilyName, NewFamily},
-    nl80211::{Nl80221Family, Nl80221Message},
+use anyhow::{anyhow, Context, Result};
+use byteorder::{ByteOrder, NetworkEndian};
+use ieee80211::{
+    Frame, FrameLayer, FrameSubtype, FrameTrait, ManagementFrame, ManagementFrameTrait,
+    ManagementSubtype, OptionalTaggedParametersTrait, TagName,
 };
+use log::{debug, info, warn};
+use pcap::{Active, Capture, Offline, Packet};
+use radiotap::RadiotapIterator;
 
-use netlink_packet_core::{
-    NetlinkMessage, NetlinkPayload, NLM_F_ACK, NLM_F_MATCH, NLM_F_REQUEST, NLM_F_ROOT,
-};
-use netlink_sys::{Protocol, Socket, SocketAddr};
+use std::{borrow::Borrow, env};
 
-#[cfg(unix)]
-use std::os::unix::io::{AsRawFd, RawFd};
+trait CaptureInterface: Sized {
+    fn from_args(args: env::Args) -> Result<Self>;
 
-use std::io::{Error, Result};
+    fn next(&mut self) -> Result<Packet>;
+
+    fn inject<B: Borrow<[u8]>>(&mut self, packet: B) -> Result<()>;
+}
+
+impl CaptureInterface for Capture<Active> {
+    fn from_args(mut args: env::Args) -> Result<Self> {
+        let device = args.nth(1).ok_or_else(|| anyhow!("No device name given"))?;
+
+        info!("Capturing from device {}", device);
+        Capture::from_device(device.as_ref())
+            .with_context(|| format!("Failed to create capture from device {}", device))?
+            .buffer_size(10 * 4046)
+            .promisc(true)
+            .open()
+            .context("Failed to open device")
+    }
+
+    fn next(&mut self) -> Result<Packet> {
+        self.next().map_err(Into::into)
+    }
+
+    fn inject<B: Borrow<[u8]>>(&mut self, packet: B) -> Result<()> {
+        self.sendpacket(packet)
+            .context("failed to write packet to pcap instance")
+    }
+}
+
+impl CaptureInterface for Capture<Offline> {
+    fn from_args(mut args: env::Args) -> Result<Self> {
+        let file = args
+            .nth(1)
+            .ok_or_else(|| anyhow!("No capture file given"))?;
+
+        info!("Replaying file {}", file);
+        Capture::from_file(&file)
+            .with_context(|| format!("Failed to read capture file from {}", file))
+    }
+
+    fn next(&mut self) -> Result<Packet> {
+        self.next().map_err(Into::into)
+    }
+
+    fn inject<B: Borrow<[u8]>>(&mut self, packet: B) -> Result<()> {
+        debug!("Would've written packet: {:02x?}", packet.borrow());
+        Ok(())
+    }
+}
 
 #[derive(Debug)]
-struct PacketSocket(RawFd);
+struct VendorSpecificTag<'a> {
+    data: &'a [u8],
+}
 
-impl PacketSocket {
-    pub fn open() -> Result<Self> {
-        let fd = unsafe { libc::socket(libc::PF_PACKET, libc::SOCK_RAW, libc::ETH_P_ALL.to_be()) };
-        if fd < 0 {
-            Err(Error::last_os_error())
+impl<'a> VendorSpecificTag<'a> {
+    fn new(data: &'a [u8]) -> Result<Self> {
+        if data.len() >= 4 {
+            Ok(Self { data })
         } else {
-            Ok(Self(fd))
+            Err(anyhow!(
+                "vendor specific tag to short to contain OUI and type"
+            ))
         }
     }
-}
 
-impl AsRawFd for PacketSocket {
-    fn as_raw_fd(&self) -> RawFd {
-        self.0
+    fn oui(&self) -> &[u8; 3] {
+        use std::convert::TryInto;
+        self.data[0..3].try_into().unwrap()
+    }
+
+    fn oui_type(&self) -> u8 {
+        self.data[3]
+    }
+
+    fn data(&self) -> &[u8] {
+        &self.data[4..]
     }
 }
 
-fn main() {
-    let get_family = ControlMessage::GetFamily(FamilyName::new("nl80211"));
-    let mut packet = NetlinkMessage::from(get_family);
-    packet.header.flags = NLM_F_REQUEST;
-    packet.finalize();
+fn parse_probe_request(frame: ManagementFrame) -> Result<Option<StreetpassTag>> {
+    let parameters = frame
+        .iter_tagged_parameters()
+        .ok_or_else(|| anyhow!("frame contains no parameters"))?;
 
-    let mut buf = vec![0; packet.header.length as usize];
-    packet.serialize(&mut buf);
-
-    println!("packet: {:02x?}", packet);
-    println!("buffer: {:02x?}", buf);
-
-    let kernel_unicast = SocketAddr::new(0, 0);
-    let socket = Socket::new(Protocol::Generic).unwrap();
-
-    socket
-        .send_to(&buf[..packet.buffer_len()], &kernel_unicast, 0)
-        .unwrap();
-
-    let mut recv_buf = vec![0; 4096];
-
-    loop {
-        let (n, _addr) = socket.recv_from(&mut recv_buf, 0).unwrap();
-        match n {
-            0 => break,
-            _ => {
-                let response_buf = &recv_buf[..n];
-                let response = NetlinkMessage::<ControlMessage>::deserialize(response_buf);
-                println!("received: {:02x?}", response_buf);
-                println!("response: {:#02x?}", response);
-
-                if let Ok(NetlinkMessage {
-                    payload: NetlinkPayload::InnerMessage(ControlMessage::NewFamily(new_family)),
-                    ..
-                }) = response
-                {
-                    get_iface(&socket, Nl80221Family::new(new_family))
+    for parameter in parameters {
+        if let Ok((TagName::Other(0xdd), data)) = parameter {
+            let tag =
+                VendorSpecificTag::new(data).with_context(|| "invalid vendor specific tag")?;
+            match (tag.oui(), tag.oui_type()) {
+                ([0x00, 0x1f, 0x32], 1) => {
+                    info!(
+                        "Found possible Nintendo Streetpass tag of length {}",
+                        tag.data().len()
+                    );
+                    return Some(StreetpassTag::parse(tag.data())).transpose();
                 }
+                (oui, type_) => debug!(
+                    "Unhandled OUI tag {:02x} by {:02x}:{:02x}:{:02x}",
+                    type_, oui[0], oui[1], oui[2],
+                ),
+            }
+        };
+    }
+
+    Ok(None)
+}
+
+fn dump_rt(buffer: &[u8]) -> Result<()> {
+    let (_attributes, payload) =
+        RadiotapIterator::parse(buffer).context("Invalid radiotap message")?;
+    debug!(
+        "payload: {:02x?} ...",
+        &payload[..32.min(payload.len() - 1)]
+    );
+
+    if let Some(FrameLayer::Management(frame)) = Frame::new(payload).next_layer() {
+        debug!(
+            "Recieved a management frame: {:?} => {:?}",
+            frame.source_address(),
+            frame.receiver_address()
+        );
+
+        if let FrameSubtype::Management(ManagementSubtype::ProbeRequest) = frame.subtype() {
+            match parse_probe_request(frame) {
+                Err(e) => warn!(
+                    "failed to parse Streetpass tag from management frame: {}",
+                    e
+                ),
+                Ok(None) => debug!("management frame did not contain a Streetpass tag"),
+                Ok(Some(tag)) => info!("Streetpass tag: {:?}", tag),
             }
         }
+    } else {
+        debug!("payload was not an IEEE802.11 management frame")
+    };
+
+    Ok(())
+}
+
+#[derive(Debug)]
+struct StreetpassService {
+    id: u32,
+    flags: u16,
+}
+
+#[derive(Debug)]
+struct StreetpassTag {
+    services: Vec<StreetpassService>,
+    console_id: u64,
+}
+
+impl StreetpassTag {
+    fn parse(data: &[u8]) -> Result<Self> {
+        let mut buf = data;
+
+        let mut services = None;
+        let mut console_id = None;
+
+        while let [id, len, rest @ ..] = buf {
+            let len = *len as usize;
+            let (tag_data, rest) = rest.split_at(len);
+            match id {
+                0x11 => {
+                    services = Some(
+                        tag_data
+                            .chunks(5)
+                            .map(|service| {
+                                debug!("service: {:02x?}", service);
+                                StreetpassService {
+                                    id: NetworkEndian::read_u24(&service[0..3]),
+                                    flags: NetworkEndian::read_u16(&service[3..5]),
+                                }
+                            })
+                            .collect(),
+                    );
+                }
+                0xf0 if tag_data.len() == 8 => {
+                    console_id = Some(NetworkEndian::read_u64(tag_data));
+                }
+                _ => debug!(
+                    "Unknown Streetpass tag attribute {:02x} of length {}",
+                    id, len
+                ),
+            };
+            buf = rest;
+        }
+
+        Ok(Self {
+            services: services.unwrap_or_default(),
+            console_id: console_id
+                .ok_or_else(|| anyhow!("Streetpass tag did not contain a console ID"))?,
+        })
     }
 }
 
-fn get_iface(socket: &Socket, nl80211: Nl80221Family) {
-    let get_iface = nl80211.tag_message(Nl80221Message::GetInterface(13.into()));
-    let mut packet = NetlinkMessage::from(get_iface);
-    packet.header.flags = NLM_F_REQUEST;
-    packet.finalize();
+fn main() -> Result<()> {
+    pretty_env_logger::init();
 
-    let mut buf = vec![0; packet.header.length as usize];
-    packet.serialize(&mut buf);
+    let mut capture = Capture::<Active>::from_args(env::args())?;
 
-    let send_buf = &buf[..packet.buffer_len()];
-    println!("get_family: {:02x?}", packet);
-    println!("sending get_family: {:02x?}", send_buf);
-    socket.send_to(send_buf, &SocketAddr::new(0, 0), 0).unwrap();
-
-    let mut recv_buf = vec![0; 4096];
-
-    loop {
-        let (n, _addr) = socket.recv_from(&mut recv_buf, 0).unwrap();
-        match n {
-            0 => break,
-            n => {
-                let response_buf = &recv_buf[..n];
-                println!("received: {:02x?}", response_buf);
-            }
-        }
+    while let Ok(packet) = capture.next() {
+        debug!("packet: {:?}", packet);
+        dump_rt(packet.data).unwrap_or_else(|e| warn!("Failed to dump radiotap header: {}", e))
     }
+
+    Ok(())
 }

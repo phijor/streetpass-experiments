@@ -1,0 +1,12 @@
+[tasks.setcap]
+dependencies = ["dev-test-flow"]
+command = "sudo"
+args = ["setcap", "cap_net_raw+eip", "${CARGO_MAKE_WORKSPACE_WORKING_DIRECTORY}/target/debug/cecd"]
+
+[tasks.dev-flow]
+dependencies = ["setcap"]
+
+[tasks.run-priv]
+dependencies = ["dev-flow"]
+command = "cargo"
+args = ["run", "${@}"]
