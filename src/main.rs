@@ -1,14 +1,30 @@
 use anyhow::{anyhow, Context, Result};
-use byteorder::{ByteOrder, NetworkEndian};
+use bytes::{
+    buf::{ext::Take, BufExt},
+    Buf, BufMut,
+};
 use ieee80211::{
-    Frame, FrameLayer, FrameSubtype, FrameTrait, ManagementFrame, ManagementFrameTrait,
-    ManagementSubtype, OptionalTaggedParametersTrait, TagName,
+    FragmentSequenceTrait, Frame, FrameLayer, FrameSubtype, FrameTrait, ManagementFrame,
+    ManagementFrameTrait, ManagementSubtype, OptionalTaggedParametersTrait, TagName,
 };
 use log::{debug, info, warn};
 use pcap::{Active, Capture, Offline, Packet};
 use radiotap::RadiotapIterator;
 
-use std::{borrow::Borrow, env};
+use std::{borrow::Borrow, env, fmt};
+
+fn discard_remaining<B: Buf>(mut taken: Take<B>) -> B {
+    taken.advance(taken.remaining());
+    taken.into_inner()
+}
+
+trait Emitable {
+    fn emit(&self, buffer: impl BufMut) -> Result<()>;
+}
+
+trait Parseable: Sized {
+    fn parse(buffer: impl Buf) -> Result<Self>;
+}
 
 trait CaptureInterface: Sized {
     fn from_args(args: env::Args) -> Result<Self>;
@@ -25,7 +41,7 @@ impl CaptureInterface for Capture<Active> {
         info!("Capturing from device {}", device);
         Capture::from_device(device.as_ref())
             .with_context(|| format!("Failed to create capture from device {}", device))?
-            .buffer_size(10 * 4046)
+            .immediate_mode(true)
             .promisc(true)
             .open()
             .context("Failed to open device")
@@ -63,55 +79,50 @@ impl CaptureInterface for Capture<Offline> {
 }
 
 #[derive(Debug)]
-struct VendorSpecificTag<'a> {
-    data: &'a [u8],
+#[repr(packed)]
+struct VendorSpecificTag {
+    oui: [u8; 3],
+    oui_type: u8,
 }
 
-impl<'a> VendorSpecificTag<'a> {
-    fn new(data: &'a [u8]) -> Result<Self> {
-        if data.len() >= 4 {
-            Ok(Self { data })
+impl Parseable for VendorSpecificTag {
+    fn parse(mut buffer: impl Buf) -> Result<Self> {
+        if buffer.remaining() >= 4 {
+            Ok(Self {
+                oui: [buffer.get_u8(), buffer.get_u8(), buffer.get_u8()],
+                oui_type: buffer.get_u8(),
+            })
         } else {
             Err(anyhow!(
                 "vendor specific tag to short to contain OUI and type"
             ))
         }
     }
-
-    fn oui(&self) -> &[u8; 3] {
-        use std::convert::TryInto;
-        self.data[0..3].try_into().unwrap()
-    }
-
-    fn oui_type(&self) -> u8 {
-        self.data[3]
-    }
-
-    fn data(&self) -> &[u8] {
-        &self.data[4..]
-    }
 }
 
-fn parse_probe_request(frame: ManagementFrame) -> Result<Option<StreetpassTag>> {
+fn parse_probe_request(frame: &ManagementFrame) -> Result<Option<StreetpassTag>> {
     let parameters = frame
         .iter_tagged_parameters()
         .ok_or_else(|| anyhow!("frame contains no parameters"))?;
 
     for parameter in parameters {
-        if let Ok((TagName::Other(0xdd), data)) = parameter {
-            let tag =
-                VendorSpecificTag::new(data).with_context(|| "invalid vendor specific tag")?;
-            match (tag.oui(), tag.oui_type()) {
-                ([0x00, 0x1f, 0x32], 1) => {
-                    info!(
+        if let Ok((TagName::Other(0xdd), mut data)) = parameter {
+            match VendorSpecificTag::parse(&mut data)
+                .with_context(|| "invalid vendor specific tag")?
+            {
+                VendorSpecificTag {
+                    oui: [0x00, 0x1f, 0x32],
+                    oui_type: 1,
+                } => {
+                    debug!(
                         "Found possible Nintendo Streetpass tag of length {}",
-                        tag.data().len()
+                        data.remaining()
                     );
-                    return Some(StreetpassTag::parse(tag.data())).transpose();
+                    return Some(StreetpassTag::parse(&mut data)).transpose();
                 }
-                (oui, type_) => debug!(
+                tag => debug!(
                     "Unhandled OUI tag {:02x} by {:02x}:{:02x}:{:02x}",
-                    type_, oui[0], oui[1], oui[2],
+                    tag.oui_type, tag.oui[0], tag.oui[1], tag.oui[2],
                 ),
             }
         };
@@ -120,13 +131,18 @@ fn parse_probe_request(frame: ManagementFrame) -> Result<Option<StreetpassTag>> 
     Ok(None)
 }
 
+fn shorten(buffer: &[u8], limit: usize) -> &[u8] {
+    if limit < buffer.len() {
+        &buffer[..limit]
+    } else {
+        buffer
+    }
+}
+
 fn dump_rt(buffer: &[u8]) -> Result<()> {
-    let (_attributes, payload) =
-        RadiotapIterator::parse(buffer).context("Invalid radiotap message")?;
-    debug!(
-        "payload: {:02x?} ...",
-        &payload[..32.min(payload.len() - 1)]
-    );
+    let (_attributes, payload) = RadiotapIterator::parse(buffer)
+        .with_context(|| format!("Invalid radiotap message ({:02x?} ...)", buffer))?;
+    debug!("payload: {:02x?} ...", shorten(buffer, 32));
 
     if let Some(FrameLayer::Management(frame)) = Frame::new(payload).next_layer() {
         debug!(
@@ -136,13 +152,22 @@ fn dump_rt(buffer: &[u8]) -> Result<()> {
         );
 
         if let FrameSubtype::Management(ManagementSubtype::ProbeRequest) = frame.subtype() {
-            match parse_probe_request(frame) {
+            match parse_probe_request(&frame) {
                 Err(e) => warn!(
                     "failed to parse Streetpass tag from management frame: {}",
                     e
                 ),
                 Ok(None) => debug!("management frame did not contain a Streetpass tag"),
-                Ok(Some(tag)) => info!("Streetpass tag: {:?}", tag),
+                Ok(Some(tag)) => info!(
+                    "[{:>4}] Beacon from {}: {:08x} advertises {:>2} service(s)",
+                    frame.sequence_number(),
+                    frame
+                        .source_address()
+                        .map(|addr| format!("{}", addr))
+                        .unwrap_or_else(|| "??:??:??:??:??:??".into()),
+                    tag.console_id(),
+                    tag.services().len()
+                ),
             }
         }
     } else {
@@ -155,7 +180,46 @@ fn dump_rt(buffer: &[u8]) -> Result<()> {
 #[derive(Debug)]
 struct StreetpassService {
     id: u32,
-    flags: u16,
+    flags: u8,
+}
+
+impl Parseable for StreetpassService {
+    fn parse(mut buffer: impl Buf) -> Result<Self> {
+        if buffer.remaining() >= 5 {
+            Ok(Self {
+                id: buffer.get_u32(),
+                flags: buffer.get_u8(),
+            })
+        } else {
+            Err(anyhow!("buffer to short to parse StreetpassService"))
+        }
+    }
+}
+
+impl Emitable for StreetpassService {
+    fn emit(&self, mut buffer: impl BufMut) -> Result<()> {
+        if buffer.remaining_mut() >= 5 {
+            buffer.put_u32(self.id);
+            buffer.put_u8(self.flags);
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "not enough space in buffer to emit StreetpassService"
+            ))
+        }
+    }
+}
+
+impl fmt::LowerHex for StreetpassService {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{:#08x}", self.id)?;
+
+        if self.flags != 0 {
+            write!(f, ":{:08b}", self.flags)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -164,40 +228,38 @@ struct StreetpassTag {
     console_id: u64,
 }
 
-impl StreetpassTag {
-    fn parse(data: &[u8]) -> Result<Self> {
-        let mut buf = data;
-
+impl Parseable for StreetpassTag {
+    fn parse(mut buffer: impl Buf) -> Result<Self> {
         let mut services = None;
         let mut console_id = None;
 
-        while let [id, len, rest @ ..] = buf {
-            let len = *len as usize;
-            let (tag_data, rest) = rest.split_at(len);
+        while buffer.remaining() >= 2 {
+            let id = buffer.get_u8();
+            let len = buffer.get_u8() as usize;
+            let mut tag_data = buffer.take(len);
+
             match id {
                 0x11 => {
-                    services = Some(
-                        tag_data
-                            .chunks(5)
-                            .map(|service| {
-                                debug!("service: {:02x?}", service);
-                                StreetpassService {
-                                    id: NetworkEndian::read_u24(&service[0..3]),
-                                    flags: NetworkEndian::read_u16(&service[3..5]),
-                                }
-                            })
-                            .collect(),
-                    );
+                    services = {
+                        let mut services = Vec::with_capacity(tag_data.remaining());
+
+                        while tag_data.has_remaining() {
+                            services.push(StreetpassService::parse(&mut tag_data)?);
+                        }
+
+                        Some(services)
+                    };
                 }
-                0xf0 if tag_data.len() == 8 => {
-                    console_id = Some(NetworkEndian::read_u64(tag_data));
+                0xf0 if tag_data.remaining() == 8 => {
+                    console_id = Some(tag_data.get_u64());
                 }
                 _ => debug!(
                     "Unknown Streetpass tag attribute {:02x} of length {}",
                     id, len
                 ),
             };
-            buf = rest;
+
+            buffer = discard_remaining(tag_data);
         }
 
         Ok(Self {
@@ -205,6 +267,44 @@ impl StreetpassTag {
             console_id: console_id
                 .ok_or_else(|| anyhow!("Streetpass tag did not contain a console ID"))?,
         })
+    }
+}
+
+impl Emitable for StreetpassTag {
+    fn emit(&self, mut buffer: impl BufMut) -> Result<()> {
+        use std::convert::TryInto;
+        if buffer.remaining_mut() >= 4 + 8 {
+            buffer.put_u8(0x11);
+            let len: u8 = self
+                .services()
+                .len()
+                .try_into()
+                .with_context(|| anyhow!("Too many services attached to StreetpassTag"))?;
+
+            buffer.put_u8(len);
+
+            for service in self.services.iter() {
+                service.emit(&mut buffer)?;
+            }
+
+            buffer.put_u8(0xf0);
+            buffer.put_u8(8);
+            buffer.put_u64(self.console_id);
+
+            Ok(())
+        } else {
+            Err(anyhow!("Not enough space in buffer to emit StreetpassTag"))
+        }
+    }
+}
+
+impl StreetpassTag {
+    pub fn console_id(&self) -> u64 {
+        self.console_id
+    }
+
+    pub fn services(&self) -> &[StreetpassService] {
+        &self.services
     }
 }
 
